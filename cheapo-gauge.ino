@@ -26,9 +26,11 @@
 #define CAN_INT 10  // INT pin on MCP2515
 
 // CAN Output config - match these to your remote device settings
-#define REMOTE_CAN_ID 0x05       // CAN ID for outgoing port data
-#define REMOTE_TABLE 7           // Remote table number for ports data
-#define REMOTE_OFFSET 75         // Remote table offset for ports data (bytes)
+#define REMOTE_CAN_ID 0x01       // CAN ID for outgoing port data
+#define REMOTE_TABLE 8           // Remote table number for ports data
+#define REMOTE_OFFSET 0         // Remote table offset for ports data (bytes)
+// With CAN ID=1, table=0, the request arrives at 0x80008080
+#define MS2_POLL_ID 0x80008080
 #define CAN_SEND_INTERVAL 100    // ms between CAN transmits
 
 // State persistence
@@ -291,29 +293,6 @@ void saveState() {
   }
 }
 
-// --- CAN Output ---
-
-void sendCANPorts() {
-  unsigned long now = millis();
-  if (now - lastCANSend < CAN_SEND_INTERVAL) return;
-  lastCANSend = now;
-
-  byte data[8] = {0};
-  // Byte 0: table number
-  data[0] = REMOTE_TABLE;
-  // Bytes 1-2: offset (16-bit big-endian)
-  data[1] = (REMOTE_OFFSET >> 8) & 0xFF;
-  data[2] = REMOTE_OFFSET & 0xFF;
-  // Byte 3: Port 1 (0=OFF, 1=ON)
-  data[3] = port1State ? 1 : 0;
-  // Byte 4: Port 2 (0=OFF, 1=ON)
-  data[4] = port2State ? 1 : 0;
-  // Byte 5: Port 3 (8 digital signals bitmask)
-  data[5] = port3State;
-
-  CAN.sendMsgBuf(REMOTE_CAN_ID, 0, 8, data);
-}
-
 // --- Port Display Functions ---
 
 void drawPort1() {
@@ -380,9 +359,32 @@ void updateCAN() {
     // 03 - TPS, BATT, EGO1, EGO2
     // 47 is eth
 
-    if (CAN.readMsgBuf(&rxId, &len, buf) == CAN_OK) {
-      int base = 0x5F0;
 
+    if (CAN.readMsgBuf(&rxId, &len, buf) == CAN_OK) {
+      // --- DEBUG: print every CAN frame ---
+  Serial.print("RX ID: 0x");
+  Serial.print(rxId, HEX);
+  Serial.print("  LEN: ");
+  Serial.print(len);
+  Serial.print("  DATA: ");
+  for (byte i = 0; i < len; i++) {
+    if (buf[i] < 0x10) Serial.print("0");
+    Serial.print(buf[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+      int base = 0x5F0;
+      if (rxId == MS2_POLL_ID) {
+        byte response[8] = {0};
+        response[0] = 0x00;  // table 0
+        response[1] = 0x00;  // offset low
+        response[2] = 0x00;  // offset high
+        response[3] = port1State ? 1 : 0;
+        response[4] = port2State ? 1 : 0;
+        response[5] = port3State;
+        CAN.sendMsgBuf(REMOTE_CAN_ID, 1, 6, response);
+      }
       if (rxId == base + 2) {
         baro = ((buf[0] << 8) | buf[1]) / 10.0;
         maps = ((buf[2] << 8) | buf[3]) / 10.0;
@@ -530,6 +532,4 @@ void loop() {
       drawPort3();
       break;
   }
-
-  sendCANPorts();
 }
