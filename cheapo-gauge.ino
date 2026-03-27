@@ -433,6 +433,7 @@ void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8
     uint16_t idx = offset + i;
     uint8_t value = 0x00;
 
+    // Example mapping for your data source
     if (table == 7) {
       if (idx == 166) value = port1State ? 1 : 0;
       else if (idx == 167) value = port2State ? 1 : 0;
