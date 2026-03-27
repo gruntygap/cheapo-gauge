@@ -10,7 +10,7 @@
 #include <Fonts/FreeMonoBold12pt7b.h>
 // CAN BUS libs
 #include <SPI.h>
-#include <mcp_can.h>
+#include <ACAN2515.h>
 #include <LittleFS.h>
 
 // Button Def
@@ -21,12 +21,9 @@
 #define OLED_ADDRESS 0x3C
 #define OLED_SDA 6
 #define OLED_SCL 7
-// CAN def
-#define CAN_CS D7   // P1 in case       // Chip Select pin for MCP2515
-#define CAN_INT 10  // INT pin on MCP2515
 
 // CAN Output config - match these to your remote device settings
-#define REMOTE_CAN_ID 1          // This device's CAN ID (set in TunerStudio "Remote CAN ID")
+#define REMOTE_CAN_ID 2          // This device's CAN ID (set in TunerStudio "Remote CAN ID")
 #define MS2_CAN_ID 0             // Megasquirt's CAN ID (usually 0)
 
 // MS2/Extra CAN protocol - 29-bit extended frames
@@ -38,7 +35,21 @@
 // State persistence
 #define STATE_FILE "/port_state.bin"
 
-MCP_CAN CAN(CAN_CS);
+static const byte INT_PIN  = D6;
+static const byte CS_PIN   = D7;
+static const byte SCK_PIN  = D8;
+static const byte MISO_PIN = D9;
+static const byte MOSI_PIN = D10;
+
+volatile uint32_t irqCount = 0;
+
+ACAN2515 can(CS_PIN, SPI, INT_PIN);
+
+static void onCanInterrupt() {
+  irqCount++;
+  can.isr();
+}
+
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
 unsigned long buttonPressTime = 0;
@@ -63,16 +74,37 @@ double tps = 0.0;
 float batt = 0.0, ego1 = 0.0, ego2 = 0.0;
 
 // Port output states (persisted to flash)
-bool port1State = false;
+bool port1State = true;
 bool port2State = false;
 uint8_t port3State = 0x00;
 int port3Cursor = 0;
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial && millis() < 3000)
-    ;
+  while (!Serial && millis() < 3000);
   Serial.println("Serial connected");
+
+  SPI.setSCK(SCK_PIN);
+  SPI.setTX(MOSI_PIN);
+  SPI.setRX(MISO_PIN);
+  SPI.setCS(CS_PIN);
+  SPI.begin();
+  pinMode(INT_PIN, INPUT_PULLUP);
+
+  ACAN2515Settings settings(
+    16UL * 1000UL * 1000UL,
+    500UL * 1000UL
+  );
+
+  settings.mRequestedMode = ACAN2515Settings::NormalMode;
+  settings.mReceiveBufferSize = 16;
+  settings.mTransmitBuffer0Size = 8;
+  settings.mTransmitBuffer1Size = 8;
+  settings.mTransmitBuffer2Size = 8;
+
+
+
+  const uint16_t errorCode = can.begin(settings, onCanInterrupt);
 
   Wire.setSDA(OLED_SDA);
   Wire.setSCL(OLED_SCL);
@@ -83,24 +115,23 @@ void setup() {
     while (1)
       ;
   }
+
   display.clearDisplay();
   display.setTextColor(WHITE);
   display.display();
 
-  if (CAN.begin(MCP_ANY, CAN_500KBPS, MCP_16MHZ) == CAN_OK) {
-    Serial.println("CAN Bus Initialized");
+  if (errorCode == 0) {
+    Serial.println("CAN init OK");
   } else {
-    Serial.println("CAN Bus Init Failed");
+    Serial.print("CAN init FAIL: 0x");
+    Serial.println(errorCode, HEX);
     display.setCursor(0, 0);
     display.setTextSize(1);
     display.print("CAN Bus Init Failed");
     display.display();
-    while (1)
-      ;
+    while (1) {}
   }
 
-  CAN.setMode(MCP_NORMAL);
-  pinMode(CAN_INT, INPUT);
   pinMode(RESET_PIN, INPUT_PULLUP);
 
   loadState();
@@ -360,90 +391,188 @@ uint32_t buildMSCANId(uint16_t var_offset, uint8_t msg_type, uint8_t from_id, ui
   return id;
 }
 
+bool decodePollRequest(const CANMessage &msg,
+                       uint8_t &fromId,
+                       uint8_t &toId,
+                       uint8_t &table,
+                       uint16_t &offset,
+                       uint8_t &count) {
+  if (!msg.ext) return false;
+  if (msg.len == 0 || msg.len > 8) return false;
+
+  const uint32_t id = msg.id;
+
+  const uint8_t msgType = (id >> 15) & 0x07;
+  fromId = (id >> 11) & 0x0F;
+  toId   = (id >> 7)  & 0x0F;
+  table  = (id >> 3)  & 0x0F;
+  offset = (id >> 18) & 0x07FF;
+  count  = msg.len;
+
+  if (msgType != MSG_REQ) return false;
+  if (toId != REMOTE_CAN_ID) return false;
+
+  return true;
+}
+
+void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8_t count) {
+  CANMessage tx;
+  tx.ext = true;
+  tx.rtr = false;
+  tx.len = count;
+
+  tx.id = buildMSCANId(offset, MSG_RSP, REMOTE_CAN_ID, requesterId, table);
+
+  // Fill requested bytes starting at offset
+  for (uint8_t i = 0; i < count; i++) {
+    uint16_t idx = offset + i;
+    uint8_t value = 0;
+
+    if (table == 0) {
+      if (idx == 0) value = port1State ? 1 : 0;
+      else if (idx == 1) value = port2State ? 1 : 0;
+      else if (idx == 2) value = port3State;
+    }
+
+    tx.data[i] = value;
+  }
+
+  bool ok = can.tryToSend(tx);
+
+  Serial.print("RSP ");
+  Serial.print(ok ? "OK " : "FAIL ");
+  Serial.print("ID=0x");
+  Serial.print(tx.id, HEX);
+  Serial.print(" LEN=");
+  Serial.print(tx.len);
+  Serial.print(" DATA=");
+  for (uint8_t i = 0; i < tx.len; i++) {
+    if (i) Serial.print(" ");
+    if (tx.data[i] < 0x10) Serial.print("0");
+    Serial.print(tx.data[i], HEX);
+  }
+  Serial.println();
+}
+
 void updateCAN() {
-  if (!digitalRead(CAN_INT)) {
-    long unsigned int rxId;
-    byte len = 0;
-    byte buf[8];
+  CANMessage rx;
+  while (can.receive(rx)) {
+    Serial.print("RX ID=0x");
+    Serial.print(rx.id, HEX);
+    Serial.print(" EXT=");
+    Serial.print(rx.ext);
+    Serial.print(" LEN=");
+    Serial.print(rx.len);
+    Serial.print(" DATA=");
+    for (uint8_t i = 0; i < rx.len; i++) {
+      if (i) Serial.print(" ");
+      if (rx.data[i] < 0x10) Serial.print("0");
+      Serial.print(rx.data[i], HEX);
+    }
+    Serial.println();
 
-    if (CAN.readMsgBuf(&rxId, &len, buf) == CAN_OK) {
-      // --- DEBUG: print every CAN frame ---
-      Serial.print("RX ID: 0x");
-      Serial.print(rxId, HEX);
-      Serial.print("  LEN: ");
-      Serial.print(len);
-      Serial.print("  DATA: ");
-      for (byte i = 0; i < len; i++) {
-        if (buf[i] < 0x10) Serial.print("0");
-        Serial.print(buf[i], HEX);
-        Serial.print(" ");
-      }
-      Serial.println();
+    uint8_t fromId, toId, table, count;
+    uint16_t offset;
 
-      // Handle MS2 poll requests (29-bit extended frames)
-      // MCP_CAN sets bit 31 on extended frame IDs
-      if (rxId & 0x80000000) {
-        uint32_t eid = rxId & 0x1FFFFFFF;  // Strip extended flag
-        uint8_t rx_msg_type = (eid >> 15) & 0x07;
-        uint8_t rx_to = (eid >> 7) & 0x0F;
+    if (decodePollRequest(rx, fromId, toId, table, offset, count)) {
+      Serial.print("Poll request from ");
+      Serial.print(fromId);
+      Serial.print(" to ");
+      Serial.print(toId);
+      Serial.print(" table=");
+      Serial.print(table);
+      Serial.print(" offset=");
+      Serial.print(offset);
+      Serial.print(" count=");
+      Serial.println(count);
 
-        if (rx_msg_type == MSG_REQ && rx_to == REMOTE_CAN_ID) {
-          // MS2 is polling us - echo table/offset back in response ID
-          uint8_t rx_from = (eid >> 11) & 0x0F;
-          uint8_t rx_var_blk = (eid >> 3) & 0x0F;
-          uint16_t rx_var_offset = (eid >> 18) & 0x7FF;
-
-          uint32_t rspId = buildMSCANId(rx_var_offset, MSG_RSP, REMOTE_CAN_ID, rx_from, rx_var_blk);
-
-          byte rspData[3];
-          rspData[0] = port1State ? 1 : 0;  // Port 1
-          rspData[1] = port2State ? 1 : 0;  // Port 2
-          rspData[2] = port3State;           // Port 3 (8 digital signals)
-
-          CAN.sendMsgBuf(rspId, 1, 3, rspData);  // ext=1 for 29-bit
-
-          Serial.print("RSP ID: 0x");
-          Serial.print(rspId, HEX);
-          Serial.print("  DATA: ");
-          for (byte i = 0; i < 3; i++) {
-            Serial.print(rspData[i], HEX);
-            Serial.print(" ");
-          }
-          Serial.println();
-        }
-      }
-
-      // Handle MS2 broadcast data (standard 11-bit frames)
-      int base = 0x5F0;
-      if (rxId == base + 2) {
-        baro = ((buf[0] << 8) | buf[1]) / 10.0;
-        maps = ((buf[2] << 8) | buf[3]) / 10.0;
-        mat = ((buf[4] << 8) | buf[5]) / 10.0;
-        clt = ((buf[6] << 8) | buf[7]) / 10.0;
-        psi = (maps - baro) * 0.145038;
-        if (psi > maxPsi) maxPsi = psi;
-      }
-      if (rxId == base + 3) {
-        tps = (int16_t)((buf[0] << 8) | buf[1]) / 10.0;
-        batt = ((buf[2] << 8) | buf[3]) / 10.0;
-        ego1 = ((buf[4] << 8) | buf[5]) / 10.0;
-        ego2 = ((buf[6] << 8) | buf[7]) / 10.0;
-      }
-      if (rxId == base + 47) {
-        //         Serial.print("ID: 0x");
-        // Serial.print(rxId, HEX);
-        // Serial.print("  Data: ");
-        // for (byte i = 0; i < len; i++) {
-        //   if (buf[i] < 0x10) Serial.print("0");
-        //   Serial.print(buf[i], HEX);
-        //   Serial.print(" ");
-        // }
-        // Serial.println();
-
-        ethanolContent = ((buf[0] << 8) | buf[1]) / 10.0;
-      }
+      sendPollResponse(fromId, table, offset, count);
     }
   }
+
+  // if (!digitalRead(CAN_INT)) {
+  //   long unsigned int rxId;
+  //   byte len = 0;
+  //   byte buf[8];
+  //
+  //   if (CAN.readMsgBuf(&rxId, &len, buf) == CAN_OK) {
+  //     // --- DEBUG: print every CAN frame ---
+  //     Serial.print("RX ID: 0x");
+  //     Serial.print(rxId, HEX);
+  //     Serial.print("  LEN: ");
+  //     Serial.print(len);
+  //     Serial.print("  DATA: ");
+  //     for (byte i = 0; i < len; i++) {
+  //       if (buf[i] < 0x10) Serial.print("0");
+  //       Serial.print(buf[i], HEX);
+  //       Serial.print(" ");
+  //     }
+  //     Serial.println();
+
+  //     // Handle MS2 poll requests (29-bit extended frames)
+  //     // MCP_CAN sets bit 31 on extended frame IDs
+  //     if (rxId & 0x80000000) {
+  //       uint32_t eid = rxId & 0x1FFFFFFF;  // Strip extended flag
+  //       uint8_t rx_msg_type = (eid >> 15) & 0x07;
+  //       uint8_t rx_to = (eid >> 7) & 0x0F;
+
+  //       if (rx_msg_type == MSG_REQ && rx_to == REMOTE_CAN_ID) {
+  //         // MS2 is polling us - echo table/offset back in response ID
+  //         uint8_t rx_from = (eid >> 11) & 0x0F;
+  //         uint8_t rx_var_blk = (eid >> 3) & 0x0F;
+  //         uint16_t rx_var_offset = (eid >> 18) & 0x7FF;
+
+  //         uint32_t rspId = buildMSCANId(rx_var_offset, MSG_RSP, REMOTE_CAN_ID, rx_from, rx_var_blk);
+
+  //         byte rspData[3];
+  //         rspData[0] = port1State ? 1 : 0;  // Port 1
+  //         rspData[1] = port2State ? 1 : 0;  // Port 2
+  //         rspData[2] = port3State;           // Port 3 (8 digital signals)
+
+  //         CAN.sendMsgBuf(rspId, 1, 3, rspData);  // ext=1 for 29-bit
+
+  //         Serial.print("RSP ID: 0x");
+  //         Serial.print(rspId, HEX);
+  //         Serial.print("  DATA: ");
+  //         for (byte i = 0; i < 3; i++) {
+  //           Serial.print(rspData[i], HEX);
+  //           Serial.print(" ");
+  //         }
+  //         Serial.println();
+  //       }
+  //     }
+
+  //     // Handle MS2 broadcast data (standard 11-bit frames)
+  //     int base = 0x5F0;
+  //     if (rxId == base + 2) {
+  //       baro = ((buf[0] << 8) | buf[1]) / 10.0;
+  //       maps = ((buf[2] << 8) | buf[3]) / 10.0;
+  //       mat = ((buf[4] << 8) | buf[5]) / 10.0;
+  //       clt = ((buf[6] << 8) | buf[7]) / 10.0;
+  //       psi = (maps - baro) * 0.145038;
+  //       if (psi > maxPsi) maxPsi = psi;
+  //     }
+  //     if (rxId == base + 3) {
+  //       tps = (int16_t)((buf[0] << 8) | buf[1]) / 10.0;
+  //       batt = ((buf[2] << 8) | buf[3]) / 10.0;
+  //       ego1 = ((buf[4] << 8) | buf[5]) / 10.0;
+  //       ego2 = ((buf[6] << 8) | buf[7]) / 10.0;
+  //     }
+  //     if (rxId == base + 47) {
+  //       //         Serial.print("ID: 0x");
+  //       // Serial.print(rxId, HEX);
+  //       // Serial.print("  Data: ");
+  //       // for (byte i = 0; i < len; i++) {
+  //       //   if (buf[i] < 0x10) Serial.print("0");
+  //       //   Serial.print(buf[i], HEX);
+  //       //   Serial.print(" ");
+  //       // }
+  //       // Serial.println();
+
+  //       ethanolContent = ((buf[0] << 8) | buf[1]) / 10.0;
+  //     }
+  //   }
+  // }
 }
 
 void handleButton() {
@@ -505,8 +634,8 @@ void handleButton() {
 }
 
 void loop() {
-  handleButton();
   updateCAN();
+  handleButton();
 
   switch (currentMode) {
     case BOOST:
