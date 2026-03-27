@@ -56,7 +56,6 @@ unsigned long buttonPressTime = 0;
 unsigned long lastTapTime = 0;
 bool buttonPressed = false;
 bool waitingForSecondPress = false;
-bool longPressDetected = false;
 
 const unsigned long tapThreshold = 300;
 const unsigned long longPressThreshold = 500;
@@ -74,8 +73,11 @@ double tps = 0.0;
 float batt = 0.0, ego1 = 0.0, ego2 = 0.0;
 
 // Port output states (persisted to flash)
+// USED FOR MAIN FAN TRIGGER
 bool port1State = false;
+// USED FOR AC FAN TRIGGER
 bool port2State = false;
+// Table switching
 uint8_t port3State = 0xFF;
 int port3Cursor = 0;
 
@@ -116,7 +118,6 @@ void setup() {
       ;
   }
 
-  display.clearDisplay();
   display.setTextColor(WHITE);
   display.display();
 
@@ -138,8 +139,6 @@ void setup() {
 }
 
 void drawBoost2() {
-  display.clearDisplay();
-
   // --- Draw Boost Bar at top ---
   int barY = 0;
   int barHeight = 6;
@@ -194,7 +193,6 @@ void drawBoost2() {
 }
 
 void drawBoost() {
-  display.clearDisplay();
   display.setTextSize(1);
 
   display.setCursor(0, 0);
@@ -222,7 +220,6 @@ void drawBoost() {
 void drawSingleStat(const char* value, const char* unit, const char* label) {
   int16_t x1, y1;
   uint16_t w, h;
-  display.clearDisplay();
 
   // --- Main numeric value ---
   display.setFont(&FreeSans18pt7b);
@@ -252,7 +249,6 @@ void drawSingleStat(const char* value, const char* unit, const char* label) {
 void drawSensor2(const char* value, const char* unit, const char* label, const char* value2, const char* unit2, const char* label2) {
   int16_t x1, y1;
   uint16_t w, h;
-  display.clearDisplay();
 
   // First Sensor Value
   display.setFont(&FreeSans9pt7b);
@@ -292,7 +288,6 @@ void drawSensor2(const char* value, const char* unit, const char* label, const c
 
   // Reset and display
   display.setFont();
-  display.display();
 }
 
 // --- State Persistence ---
@@ -328,15 +323,14 @@ void saveState() {
 // --- Port Display Functions ---
 
 void drawPort1() {
-  drawSingleStat(port1State ? "ON" : "OFF", "", "Port 1");
+  drawSingleStat(port1State ? "ON" : "OFF", "", "Fan 1");
 }
 
 void drawPort2() {
-  drawSingleStat(port2State ? "ON" : "OFF", "", "Port 2");
+  drawSingleStat(port2State ? "ON" : "OFF", "", "Fan 2");
 }
 
 void drawPort3() {
-  display.clearDisplay();
 
   // Title + selected bit info
   display.setFont();
@@ -462,7 +456,9 @@ void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8
 
 void updateCAN() {
   CANMessage rx;
+
   while (can.receive(rx)) {
+    // --- DEBUG: print every CAN frame ---
     Serial.print("RX ID=0x");
     Serial.print(rx.id, HEX);
     Serial.print(" EXT=");
@@ -477,127 +473,81 @@ void updateCAN() {
     }
     Serial.println();
 
-    uint8_t fromId, toId, table, count;
-    uint16_t offset;
+    // ------------------------------------------------------------
+    // Handle MS2 poll requests (29-bit extended frames)
+    // ------------------------------------------------------------
+    if (rx.ext) {
+      uint8_t fromId, toId, table, count;
+      uint16_t offset;
 
-    if (decodePollRequest(rx, fromId, toId, table, offset, count)) {
-      Serial.print("Poll request from ");
-      Serial.print(fromId);
-      Serial.print(" to ");
-      Serial.print(toId);
-      Serial.print(" table=");
-      Serial.print(table);
-      Serial.print(" offset=");
-      Serial.print(offset);
-      Serial.print(" count=");
-      Serial.println(count);
+      if (decodePollRequest(rx, fromId, toId, table, offset, count)) {
+        Serial.print("Poll request from ");
+        Serial.print(fromId);
+        Serial.print(" to ");
+        Serial.print(toId);
+        Serial.print(" table=");
+        Serial.print(table);
+        Serial.print(" offset=");
+        Serial.print(offset);
+        Serial.print(" count=");
+        Serial.println(count);
 
-      sendPollResponse(fromId, table, offset, count);
+        sendPollResponse(fromId, table, offset, count);
+      }
+
+      // Extended frame handled, skip standard-frame logic
+      continue;
+    }
+
+    // ------------------------------------------------------------
+    // Handle MS2 broadcast data (standard 11-bit frames)
+    // ------------------------------------------------------------
+    const uint16_t base = 0x5F0;
+
+    if (rx.id == (base + 2) && rx.len >= 8) {
+      baro = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
+      maps = ((rx.data[2] << 8) | rx.data[3]) / 10.0;
+      mat  = ((rx.data[4] << 8) | rx.data[5]) / 10.0;
+      clt  = ((rx.data[6] << 8) | rx.data[7]) / 10.0;
+
+      psi = (maps - baro) * 0.145038;
+      if (psi > maxPsi) {
+        maxPsi = psi;
+      }
+    }
+
+    if (rx.id == (base + 3) && rx.len >= 8) {
+      tps  = (int16_t)((rx.data[0] << 8) | rx.data[1]) / 10.0;
+      batt = ((rx.data[2] << 8) | rx.data[3]) / 10.0;
+      ego1 = ((rx.data[4] << 8) | rx.data[5]) / 10.0;
+      ego2 = ((rx.data[6] << 8) | rx.data[7]) / 10.0;
+    }
+
+    if (rx.id == (base + 47) && rx.len >= 2) {
+      ethanolContent = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
     }
   }
-
-  // if (!digitalRead(CAN_INT)) {
-  //   long unsigned int rxId;
-  //   byte len = 0;
-  //   byte buf[8];
-  //
-  //   if (CAN.readMsgBuf(&rxId, &len, buf) == CAN_OK) {
-  //     // --- DEBUG: print every CAN frame ---
-  //     Serial.print("RX ID: 0x");
-  //     Serial.print(rxId, HEX);
-  //     Serial.print("  LEN: ");
-  //     Serial.print(len);
-  //     Serial.print("  DATA: ");
-  //     for (byte i = 0; i < len; i++) {
-  //       if (buf[i] < 0x10) Serial.print("0");
-  //       Serial.print(buf[i], HEX);
-  //       Serial.print(" ");
-  //     }
-  //     Serial.println();
-
-  //     // Handle MS2 poll requests (29-bit extended frames)
-  //     // MCP_CAN sets bit 31 on extended frame IDs
-  //     if (rxId & 0x80000000) {
-  //       uint32_t eid = rxId & 0x1FFFFFFF;  // Strip extended flag
-  //       uint8_t rx_msg_type = (eid >> 15) & 0x07;
-  //       uint8_t rx_to = (eid >> 7) & 0x0F;
-
-  //       if (rx_msg_type == MSG_REQ && rx_to == REMOTE_CAN_ID) {
-  //         // MS2 is polling us - echo table/offset back in response ID
-  //         uint8_t rx_from = (eid >> 11) & 0x0F;
-  //         uint8_t rx_var_blk = (eid >> 3) & 0x0F;
-  //         uint16_t rx_var_offset = (eid >> 18) & 0x7FF;
-
-  //         uint32_t rspId = buildMSCANId(rx_var_offset, MSG_RSP, REMOTE_CAN_ID, rx_from, rx_var_blk);
-
-  //         byte rspData[3];
-  //         rspData[0] = port1State ? 1 : 0;  // Port 1
-  //         rspData[1] = port2State ? 1 : 0;  // Port 2
-  //         rspData[2] = port3State;           // Port 3 (8 digital signals)
-
-  //         CAN.sendMsgBuf(rspId, 1, 3, rspData);  // ext=1 for 29-bit
-
-  //         Serial.print("RSP ID: 0x");
-  //         Serial.print(rspId, HEX);
-  //         Serial.print("  DATA: ");
-  //         for (byte i = 0; i < 3; i++) {
-  //           Serial.print(rspData[i], HEX);
-  //           Serial.print(" ");
-  //         }
-  //         Serial.println();
-  //       }
-  //     }
-
-  //     // Handle MS2 broadcast data (standard 11-bit frames)
-  //     int base = 0x5F0;
-  //     if (rxId == base + 2) {
-  //       baro = ((buf[0] << 8) | buf[1]) / 10.0;
-  //       maps = ((buf[2] << 8) | buf[3]) / 10.0;
-  //       mat = ((buf[4] << 8) | buf[5]) / 10.0;
-  //       clt = ((buf[6] << 8) | buf[7]) / 10.0;
-  //       psi = (maps - baro) * 0.145038;
-  //       if (psi > maxPsi) maxPsi = psi;
-  //     }
-  //     if (rxId == base + 3) {
-  //       tps = (int16_t)((buf[0] << 8) | buf[1]) / 10.0;
-  //       batt = ((buf[2] << 8) | buf[3]) / 10.0;
-  //       ego1 = ((buf[4] << 8) | buf[5]) / 10.0;
-  //       ego2 = ((buf[6] << 8) | buf[7]) / 10.0;
-  //     }
-  //     if (rxId == base + 47) {
-  //       //         Serial.print("ID: 0x");
-  //       // Serial.print(rxId, HEX);
-  //       // Serial.print("  Data: ");
-  //       // for (byte i = 0; i < len; i++) {
-  //       //   if (buf[i] < 0x10) Serial.print("0");
-  //       //   Serial.print(buf[i], HEX);
-  //       //   Serial.print(" ");
-  //       // }
-  //       // Serial.println();
-
-  //       ethanolContent = ((buf[0] << 8) | buf[1]) / 10.0;
-  //     }
-  //   }
-  // }
 }
 
 void handleButton() {
-  static bool inLongPress = false;
   int state = digitalRead(RESET_PIN);
   unsigned long now = millis();
 
+  // Button pressed
   if (state == LOW && !buttonPressed) {
     buttonPressed = true;
     buttonPressTime = now;
-    inLongPress = false;
   }
 
+  // Button released
   if (state == HIGH && buttonPressed) {
     buttonPressed = false;
     unsigned long duration = now - buttonPressTime;
 
     if (duration >= longPressThreshold) {
-      // Long press: toggle port value on port screens, reset max on others
+      // Long press
+      waitingForSecondPress = false;
+
       if (currentMode == PORT1) {
         port1State = !port1State;
         saveState();
@@ -611,12 +561,15 @@ void handleButton() {
         maxPsi = -14.7;
         psi = -14.7;
       }
-      inLongPress = true;
     } else {
-      if (waitingForSecondPress && (now - lastTapTime) <= tapThreshold) {
-        // Double press: previous screen
+      // Short press: either start waiting for double tap, or consume second tap
+      if (waitingForSecondPress && (now - lastTapTime <= tapThreshold)) {
         waitingForSecondPress = false;
-        if (currentMode == PORT3) port3Cursor = 0;
+
+        // Double press: previous screen
+        if (currentMode == PORT3) {
+          port3Cursor = 0;
+        }
         currentMode = (DisplayMode)(((int)currentMode - 1 + NUM_MODES) % NUM_MODES);
       } else {
         waitingForSecondPress = true;
@@ -625,21 +578,23 @@ void handleButton() {
     }
   }
 
-  if (waitingForSecondPress && (now - lastTapTime) > tapThreshold) {
-    if (!inLongPress) {
-      // Single press: advance cursor on PORT3, or next screen
-      if (currentMode == PORT3 && port3Cursor < 7) {
-        port3Cursor++;
-      } else {
-        if (currentMode == PORT3) port3Cursor = 0;
-        currentMode = (DisplayMode)(((int)currentMode + 1) % NUM_MODES);
-      }
-    }
+  // Single tap confirmed after timeout
+  if (!buttonPressed && waitingForSecondPress && (now - lastTapTime > tapThreshold)) {
     waitingForSecondPress = false;
+
+    if (currentMode == PORT3 && port3Cursor < 7) {
+      port3Cursor++;
+    } else {
+      if (currentMode == PORT3) {
+        port3Cursor = 0;
+      }
+      currentMode = (DisplayMode)(((int)currentMode + 1) % NUM_MODES);
+    }
   }
 }
 
 void loop() {
+  display.clearDisplay();
   updateCAN();
   handleButton();
 
@@ -697,4 +652,5 @@ void loop() {
       drawPort3();
       break;
   }
+
 }
