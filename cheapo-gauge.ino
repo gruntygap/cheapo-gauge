@@ -74,9 +74,9 @@ double tps = 0.0;
 float batt = 0.0, ego1 = 0.0, ego2 = 0.0;
 
 // Port output states (persisted to flash)
-bool port1State = true;
+bool port1State = false;
 bool port2State = false;
-uint8_t port3State = 0x00;
+uint8_t port3State = 0xFF;
 int port3Cursor = 0;
 
 void setup() {
@@ -398,19 +398,25 @@ bool decodePollRequest(const CANMessage &msg,
                        uint16_t &offset,
                        uint8_t &count) {
   if (!msg.ext) return false;
-  if (msg.len == 0 || msg.len > 8) return false;
+  // if (msg.len == 0 || msg.len > 8) return false;
+  if (msg.len != 3) return false;
 
   const uint32_t id = msg.id;
 
   const uint8_t msgType = (id >> 15) & 0x07;
   fromId = (id >> 11) & 0x0F;
   toId   = (id >> 7)  & 0x0F;
-  table  = (id >> 3)  & 0x0F;
-  offset = (id >> 18) & 0x07FF;
-  count  = msg.len;
 
   if (msgType != MSG_REQ) return false;
   if (toId != REMOTE_CAN_ID) return false;
+
+  // Request payload format:
+  // data[0] = table/page
+  // data[1] = offset bits 10:3
+  // data[2] = offset bits 2:0 in bits 7:5, count in bits 4:0
+  table  = msg.data[0];
+  offset = ((uint16_t)msg.data[1] << 3) | (msg.data[2] >> 5);
+  count  = msg.data[2] & 0x1F;
 
   return true;
 }
@@ -423,15 +429,14 @@ void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8
 
   tx.id = buildMSCANId(offset, MSG_RSP, REMOTE_CAN_ID, requesterId, table);
 
-  // Fill requested bytes starting at offset
   for (uint8_t i = 0; i < count; i++) {
     uint16_t idx = offset + i;
-    uint8_t value = 0;
+    uint8_t value = 0x00;
 
-    if (table == 0) {
-      if (idx == 0) value = port1State ? 1 : 0;
-      else if (idx == 1) value = port2State ? 1 : 0;
-      else if (idx == 2) value = port3State;
+    if (table == 7) {
+      if (idx == 166) value = port1State ? 1 : 0;
+      else if (idx == 167) value = port2State ? 1 : 0;
+      else if (idx == 168) value = port3State & 0xFF;
     }
 
     tx.data[i] = value;
