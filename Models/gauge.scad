@@ -40,9 +40,14 @@ difference() {
         d = top_diameter - 2 * wall_thickness,
         $fn = 60
     );
-    translate([8.5,8,4.9])
+    translate([16,0,4.9])
     rotate([180,0,0])
-    keycap_hollow();
+    
+    cylinder(h= 30, d = 7.1, $fn = 60);
+    translate([16,0,-0.5])
+    rotate([180,0,0])
+    
+    cylinder(h = 0.5, d = 12.1, $fn = 60);
     translate([-1,0,0])
     rotate([0,0,90])
     union() {
