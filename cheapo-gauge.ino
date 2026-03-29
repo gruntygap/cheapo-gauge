@@ -143,57 +143,71 @@ void setup() {
   loadState();
 }
 
+int boostBarX(float value) {
+  const int barLeft = 1;
+  const int barRight = SCREEN_WIDTH - 2;
+  const int innerWidth = barRight - barLeft;
+  const int vacuumWidth = 24;
+  const int boostWidth = innerWidth - vacuumWidth;
+  const float clampedValue = constrain(value, -14.0, 20.0);
+
+  if (clampedValue <= 0.0f) {
+    return barLeft + map((int)(clampedValue * 10.0f), -140, 0, 0, vacuumWidth);
+  }
+
+  return barLeft + vacuumWidth + map((int)(clampedValue * 10.0f), 0, 200, 0, boostWidth);
+}
+
 void drawBoost2() {
-  // --- Draw Boost Bar at top ---
-  int barY = 0;
-  int barHeight = 6;
-  int zeroPoint = map(0 * 10, -147, 200, 0, SCREEN_WIDTH);
-  int barX = map(psi * 10, -147, 200, 0, SCREEN_WIDTH);
-  barX = constrain(barX, 0, SCREEN_WIDTH);
+  const int barX = 0;
+  const int barY = 0;
+  const int barHeight = 9;
+  const int barInnerTop = barY + 1;
+  const int barInnerHeight = barHeight - 2;
+  const int zeroPoint = boostBarX(0.0f);
+  const int currentX = boostBarX(psi);
+  const int peakX = boostBarX(max(maxPsi, 0.0f));
 
-  display.drawLine(zeroPoint, barY, zeroPoint, barY + barHeight, WHITE);
-  if (barX >= zeroPoint)
-    display.fillRect(zeroPoint, barY, barX - zeroPoint, barHeight, WHITE);
-  else
-    display.fillRect(barX, barY, zeroPoint - barX, barHeight, WHITE);
+  display.drawRect(barX, barY, SCREEN_WIDTH, barHeight, WHITE);
+  display.drawFastVLine(zeroPoint, barInnerTop, barInnerHeight, WHITE);
 
-  display.drawRect(0, barY, SCREEN_WIDTH, barHeight, WHITE);
+  if (psi >= 0.0f) {
+    const int fillWidth = max(1, currentX - zeroPoint);
+    display.fillRect(zeroPoint, barInnerTop, fillWidth, barInnerHeight, WHITE);
+  } else {
+    for (int x = currentX; x < zeroPoint; x += 3) {
+      display.drawFastVLine(x, barInnerTop, barInnerHeight, WHITE);
+    }
+  }
 
-  // --- Draw Max label and value at top right ---
-  display.setFont();
+  if (maxPsi > 0.0f) {
+    display.drawFastVLine(peakX, barY, barHeight, BLACK);
+    display.drawFastVLine(peakX, barY + 1, barHeight - 2, WHITE);
+    display.drawPixel(peakX - 1, barY + 1, WHITE);
+    display.drawPixel(peakX + 1, barY + 1, WHITE);
+  }
+
   int16_t x1, y1;
   uint16_t w, h;
-
-  display.getTextBounds("Max:", 0, 0, &x1, &y1, &w, &h);
-  int maxLabelX = SCREEN_WIDTH - (w + x1);
-  int maxLabelY = SCREEN_HEIGHT - (h * 2 + 1);
-  display.setCursor(maxLabelX, maxLabelY);
-  display.print("Max:");
-
-  char maxStr[6];
-  snprintf(maxStr, sizeof(maxStr), "%.1f", maxPsi);
-  display.getTextBounds(maxStr, 0, 0, &x1, &y1, &w, &h);
-  int maxValX = SCREEN_WIDTH - (w + x1);
-  int maxValY = SCREEN_HEIGHT - h;
-  display.setCursor(maxValX, maxValY);
-  display.print(maxStr);
-
-  // --- Draw current PSI (left-aligned, bottom-left) ---
-  display.setFont(&FreeMonoBold12pt7b);
+  display.setFont(&FreeSans18pt7b);
   char psiStr[8];
-  snprintf(psiStr, sizeof(psiStr), "%5.1f", psi);
-  display.getTextBounds("00.0", 0, 0, &x1, &y1, &w, &h);
-  int psiX = 0;
+  if (psi > 99.9f || psi < -99.9f) {
+    snprintf(psiStr, sizeof(psiStr), "%.0f", psi);
+  } else {
+    snprintf(psiStr, sizeof(psiStr), "%4.1f", psi);
+  }
+  display.getTextBounds(psiStr, 0, 0, &x1, &y1, &w, &h);
+  int psiX = 0 - x1;
   int psiY = SCREEN_HEIGHT - 1;
   display.setCursor(psiX, psiY);
   display.print(psiStr);
 
-  // --- Optional: Draw "PSI" label just after number ---
-  display.setFont(&FreeSansBoldOblique9pt7b);
-  display.setCursor((SCREEN_WIDTH / 2) + 4, psiY);
+  display.setFont(&FreeSans9pt7b);
+  display.getTextBounds("PSI", 0, 0, &x1, &y1, &w, &h);
+  display.setCursor(SCREEN_WIDTH - w - 1, SCREEN_HEIGHT - 2);
   display.print("PSI");
 
-  display.setFont();  // Reset font
+  display.setFont();
   display.display();
 }
 
