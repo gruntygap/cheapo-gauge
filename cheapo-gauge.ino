@@ -14,13 +14,13 @@
 #include <LittleFS.h>
 
 // Button Def
-#define RESET_PIN 26
+#define RESET_PIN D0
 // Screen Def
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
 #define OLED_ADDRESS 0x3C
-#define OLED_SDA 6
-#define OLED_SCL 7
+#define OLED_SDA D4
+#define OLED_SCL D5
 
 // CAN Output config - match these to your remote device settings
 #define REMOTE_CAN_ID 2          // This device's CAN ID (set in TunerStudio "Remote CAN ID")
@@ -57,7 +57,7 @@ unsigned long lastTapTime = 0;
 bool buttonPressed = false;
 bool waitingForSecondPress = false;
 
-const unsigned long tapThreshold = 300;
+const unsigned long tapThreshold = 200;
 const unsigned long longPressThreshold = 500;
 
 // Modes
