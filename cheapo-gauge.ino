@@ -288,6 +288,7 @@ void drawSensor2(const char* value, const char* unit, const char* label, const c
 
   // Reset and display
   display.setFont();
+  display.display();
 }
 
 // --- State Persistence ---
@@ -495,7 +496,6 @@ void updateCAN() {
         sendPollResponse(fromId, table, offset, count);
       }
 
-      // Extended frame handled, skip standard-frame logic
       continue;
     }
 
@@ -652,5 +652,4 @@ void loop() {
       drawPort3();
       break;
   }
-
 }
