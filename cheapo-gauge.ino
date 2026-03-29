@@ -13,8 +13,11 @@
 #include <ACAN2515.h>
 #include <LittleFS.h>
 
-// Button Def
-#define RESET_PIN 26
+// Rotary encoder inputs
+// Update these to the GPIOs wired to your encoder/interface board.
+#define ENCODER_LEFT_PIN 26
+#define ENCODER_RIGHT_PIN 27
+#define ENCODER_PRESS_PIN 28
 // Screen Def
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 32
@@ -52,13 +55,15 @@ static void onCanInterrupt() {
 
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
 
-unsigned long buttonPressTime = 0;
-unsigned long lastTapTime = 0;
-bool buttonPressed = false;
-bool waitingForSecondPress = false;
+const unsigned long inputDebounceMs = 30;
 
-const unsigned long tapThreshold = 300;
-const unsigned long longPressThreshold = 500;
+bool leftPressed = false;
+bool rightPressed = false;
+bool pressPressed = false;
+
+unsigned long leftLastChangeTime = 0;
+unsigned long rightLastChangeTime = 0;
+unsigned long pressLastChangeTime = 0;
 
 // Modes
 enum DisplayMode { BOOST, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, EGO, PORT1, PORT2, PORT3 };
@@ -104,8 +109,6 @@ void setup() {
   settings.mTransmitBuffer1Size = 8;
   settings.mTransmitBuffer2Size = 8;
 
-
-
   const uint16_t errorCode = can.begin(settings, onCanInterrupt);
 
   Wire.setSDA(OLED_SDA);
@@ -133,7 +136,9 @@ void setup() {
     while (1) {}
   }
 
-  pinMode(RESET_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_LEFT_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_RIGHT_PIN, INPUT_PULLUP);
+  pinMode(ENCODER_PRESS_PIN, INPUT_PULLUP);
 
   loadState();
 }
@@ -529,74 +534,73 @@ void updateCAN() {
   }
 }
 
-void handleButton() {
-  int state = digitalRead(RESET_PIN);
-  unsigned long now = millis();
+void goToPreviousMode() {
+  if (currentMode == PORT3) {
+    port3Cursor = 0;
+  }
+  currentMode = (DisplayMode)(((int)currentMode - 1 + NUM_MODES) % NUM_MODES);
+}
 
-  // Button pressed
-  if (state == LOW && !buttonPressed) {
-    buttonPressed = true;
-    buttonPressTime = now;
+void goToNextMode() {
+  if (currentMode == PORT3 && port3Cursor < 7) {
+    port3Cursor++;
+    return;
   }
 
-  // Button released
-  if (state == HIGH && buttonPressed) {
-    buttonPressed = false;
-    unsigned long duration = now - buttonPressTime;
-
-    if (duration >= longPressThreshold) {
-      // Long press
-      waitingForSecondPress = false;
-
-      if (currentMode == PORT1) {
-        port1State = !port1State;
-        saveState();
-      } else if (currentMode == PORT2) {
-        port2State = !port2State;
-        saveState();
-      } else if (currentMode == PORT3) {
-        port3State ^= (1 << port3Cursor);
-        saveState();
-      } else {
-        maxPsi = -14.7;
-        psi = -14.7;
-      }
-    } else {
-      // Short press: either start waiting for double tap, or consume second tap
-      if (waitingForSecondPress && (now - lastTapTime <= tapThreshold)) {
-        waitingForSecondPress = false;
-
-        // Double press: previous screen
-        if (currentMode == PORT3) {
-          port3Cursor = 0;
-        }
-        currentMode = (DisplayMode)(((int)currentMode - 1 + NUM_MODES) % NUM_MODES);
-      } else {
-        waitingForSecondPress = true;
-        lastTapTime = now;
-      }
-    }
+  if (currentMode == PORT3) {
+    port3Cursor = 0;
   }
 
-  // Single tap confirmed after timeout
-  if (!buttonPressed && waitingForSecondPress && (now - lastTapTime > tapThreshold)) {
-    waitingForSecondPress = false;
+  currentMode = (DisplayMode)(((int)currentMode + 1) % NUM_MODES);
+}
 
-    if (currentMode == PORT3 && port3Cursor < 7) {
-      port3Cursor++;
-    } else {
-      if (currentMode == PORT3) {
-        port3Cursor = 0;
-      }
-      currentMode = (DisplayMode)(((int)currentMode + 1) % NUM_MODES);
-    }
+void handlePressAction() {
+  if (currentMode == PORT1) {
+    port1State = !port1State;
+    saveState();
+  } else if (currentMode == PORT2) {
+    port2State = !port2State;
+    saveState();
+  } else if (currentMode == PORT3) {
+    port3State ^= (1 << port3Cursor);
+    saveState();
+  } else {
+    maxPsi = -14.7;
+    psi = -14.7;
+  }
+}
+
+bool consumeDebouncedPress(byte pin, bool &pressedState, unsigned long &lastChangeTime, unsigned long now) {
+  const bool active = digitalRead(pin) == LOW;
+  if (active != pressedState && (now - lastChangeTime) >= inputDebounceMs) {
+    lastChangeTime = now;
+    pressedState = active;
+    return active;
+  }
+
+  return false;
+}
+
+void handleEncoderInput() {
+  const unsigned long now = millis();
+
+  if (consumeDebouncedPress(ENCODER_LEFT_PIN, leftPressed, leftLastChangeTime, now)) {
+    goToPreviousMode();
+  }
+
+  if (consumeDebouncedPress(ENCODER_RIGHT_PIN, rightPressed, rightLastChangeTime, now)) {
+    goToNextMode();
+  }
+
+  if (consumeDebouncedPress(ENCODER_PRESS_PIN, pressPressed, pressLastChangeTime, now)) {
+    handlePressAction();
   }
 }
 
 void loop() {
   display.clearDisplay();
   updateCAN();
-  handleButton();
+  handleEncoderInput();
 
   switch (currentMode) {
     case BOOST:
