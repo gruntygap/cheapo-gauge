@@ -75,16 +75,23 @@ const unsigned long tapThreshold = 200;
 const unsigned long longPressThreshold = 500;
 
 // Modes
-enum DisplayMode { LAMBDAO2, BOOST, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, AFRCMP, EGO, PORT1, PORT2, PORT3 };
-#define NUM_MODES 12
+enum DisplayMode { LAMBDAO2, BOOST, RPMMODE, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, IDLECTRL, AFRCMP, ADVANCE, EGO, PORT1, PORT2, PORT3 };
+#define NUM_MODES 15
 DisplayMode currentMode = BOOST;
 
 // Sensor data
 float psi = 0.0, maxPsi = -14.7;
 float baro = 0.0, maps = 0.0, mat = 0.0, clt = 0.0;
 float ethanolContent = 0.0;
+float rpm = 0.0;
 double tps = 0.0;
 float batt = 0.0, ego1 = 0.0, ego2 = 0.0;
+float warmcorr = 0.0;
+float iacStep = 0.0;
+float clIdleTarget = 0.0;
+float ignAdv = 0.0;
+float ignAdvBase = 0.0;
+float ignAdvIdle = 0.0;
 float lambdaValue = 0.0;
 float oxygenPercent = 0.0;
 float aemSystemVolts = 0.0;
@@ -315,6 +322,60 @@ void drawSensor2(const char* value, const char* unit, const char* label, const c
 
   // Reset and display
   display.setFont();
+  display.display();
+}
+
+void drawQuadStat(const char* value1, const char* label1,
+                  const char* value2, const char* label2,
+                  const char* value3, const char* label3,
+                  const char* value4, const char* label4) {
+  display.setFont();
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print(label1);
+  display.print(":");
+  display.print(value1);
+
+  display.setCursor(64, 0);
+  display.print(label2);
+  display.print(":");
+  display.print(value2);
+
+  display.setCursor(0, 16);
+  display.print(label3);
+  display.print(":");
+  display.print(value3);
+
+  display.setCursor(64, 16);
+  display.print(label4);
+  display.print(":");
+  display.print(value4);
+
+  display.display();
+}
+
+void drawTripleStat(const char* value1, const char* label1,
+                    const char* value2, const char* label2,
+                    const char* value3, const char* label3) {
+  display.setFont();
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print(label1);
+  display.print(":");
+  display.print(value1);
+
+  display.setCursor(64, 0);
+  display.print(label2);
+  display.print(":");
+  display.print(value2);
+
+  display.setCursor(0, 16);
+  display.print(label3);
+  display.print(":");
+  display.print(value3);
+
   display.display();
 }
 
@@ -632,6 +693,14 @@ void updateCAN() {
     // ------------------------------------------------------------
     const uint16_t base = 0x5F0;
 
+    if (rx.id == (base) && rx.len >= 8) {
+      rpm = ((rx.data[6] << 8) | rx.data[7]);
+    }
+
+    if (rx.id == (base + 1) && rx.len >= 8) {
+      ignAdv = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
+    }
+
     if (rx.id == (base + 2) && rx.len >= 8) {
       baro = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
       maps = ((rx.data[2] << 8) | rx.data[3]) / 10.0;
@@ -651,8 +720,25 @@ void updateCAN() {
       ego2 = ((rx.data[6] << 8) | rx.data[7]) / 10.0;
     }
 
+    if (rx.id == (base + 5) && rx.len >= 8) {
+      warmcorr = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+    }
+
+    if (rx.id == (base + 6) && rx.len >= 8) {
+      iacStep = (int16_t)((rx.data[6] << 8) | rx.data[7]);
+    }
+
+    if (rx.id == (base + 28) && rx.len >= 8) {
+      clIdleTarget = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+    }
+
     if (rx.id == (base + 47) && rx.len >= 2) {
       ethanolContent = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
+    }
+
+    if (rx.id == (base + 57) && rx.len >= 8) {
+      ignAdvBase = (int16_t)((rx.data[0] << 8) | rx.data[1]) / 10.0;
+      ignAdvIdle = (int16_t)((rx.data[2] << 8) | rx.data[3]) / 10.0;
     }
   }
 }
@@ -730,6 +816,11 @@ void loop() {
     case BOOST:
       drawBoost2();
       break;
+    case RPMMODE:
+      char rpmBuffer[8];
+      snprintf(rpmBuffer, sizeof(rpmBuffer), "%.0f", rpm);
+      drawSingleStat(rpmBuffer, "", "RPM");
+      break;
     case ETHANOL:
       char ethBuffer[8];
       snprintf(ethBuffer, sizeof(ethBuffer), "E%2.1f", ethanolContent);
@@ -754,7 +845,7 @@ void loop() {
       snprintf(matBuffer, sizeof(matBuffer), "%.1f", mat);
       char cltBuffer[8];
       snprintf(cltBuffer, sizeof(cltBuffer), "%.1f", clt);
-      drawSensor2(matBuffer, " C", "MAT", cltBuffer, " C", "CLT");
+      drawSensor2(matBuffer, " F", "MAT", cltBuffer, " F", "CLT");
       break;
     case BAROMAP:
       char baroBuffer[8];
@@ -763,12 +854,32 @@ void loop() {
       snprintf(mapsBuffer, sizeof(mapsBuffer), "%.1f", maps);
       drawSensor2(baroBuffer, "kpa", "BARO", mapsBuffer, "kpa", "MAP");
       break;
+    case IDLECTRL:
+      char idleAdvBuf[8];
+      snprintf(idleAdvBuf, sizeof(idleAdvBuf), "%.1f", ignAdvIdle);
+      char clIdleBuf[8];
+      snprintf(clIdleBuf, sizeof(clIdleBuf), "%.0f", clIdleTarget);
+      char warmcorrBuf[8];
+      snprintf(warmcorrBuf, sizeof(warmcorrBuf), "%.1f", warmcorr);
+      char iacStepBuf[8];
+      snprintf(iacStepBuf, sizeof(iacStepBuf), "%.0f", iacStep);
+      drawQuadStat(idleAdvBuf, "ICAdv", clIdleBuf, "Trgt", warmcorrBuf, "WUE", iacStepBuf, "IAC");
+      break;
     case AFRCMP:
       char aemAfrBuf[8];
       snprintf(aemAfrBuf, sizeof(aemAfrBuf), "%.1f", lambdaValue * 14.7f);
       char ego1CompareBuf[8];
       snprintf(ego1CompareBuf, sizeof(ego1CompareBuf), "%.1f", ego1);
       drawSensor2(aemAfrBuf, "", "AEMAFR", ego1CompareBuf, "", "EGO1");
+      break;
+    case ADVANCE:
+      char ignAdvBuf[8];
+      snprintf(ignAdvBuf, sizeof(ignAdvBuf), "%.1f", ignAdv);
+      char ignAdvBaseBuf[8];
+      snprintf(ignAdvBaseBuf, sizeof(ignAdvBaseBuf), "%.1f", ignAdvBase);
+      char ignAdvIdleBuf[8];
+      snprintf(ignAdvIdleBuf, sizeof(ignAdvIdleBuf), "%.1f", ignAdvIdle);
+      drawTripleStat(ignAdvBuf, "Adv", ignAdvBaseBuf, "Base", ignAdvIdleBuf, "Idle");
       break;
     case EGO:
       char ego1Buf[8];
