@@ -25,6 +25,20 @@
 // CAN Output config - match these to your remote device settings
 #define REMOTE_CAN_ID 2          // This device's CAN ID (set in TunerStudio "Remote CAN ID")
 #define MS2_CAN_ID 0             // Megasquirt's CAN ID (usually 0)
+#define PORTS_DATA_TABLE 7
+#define PORT_1_OFFSET 166
+#define PORT_2_OFFSET 167
+#define PORT_3_OFFSET 168
+
+// AEM X-Series UEGO / AEMnet config
+// "ID 1" on the gauge corresponds to arbitration ID 0x180, "ID 16" -> 0x18F.
+#define AEMNET_GAUGE_ID 1
+#define AEMNET_BASE_ID 0x180UL
+#define AEMNET_ADC_TABLE PORTS_DATA_TABLE
+#define AEMNET_ADC0_OFFSET 104
+#define AEMNET_ADC1_OFFSET 106
+#define AEMNET_ADC2_OFFSET 108
+#define AEMNET_ADC3_OFFSET 110
 
 // MS2/Extra CAN protocol - 29-bit extended frames
 // ID layout: [var_offset(11)][msg_type(3)][from_id(4)][to_id(4)][var_blk(4)][spare(3)]
@@ -61,16 +75,36 @@ const unsigned long tapThreshold = 200;
 const unsigned long longPressThreshold = 500;
 
 // Modes
-enum DisplayMode { BOOST, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, EGO, PORT1, PORT2, PORT3 };
-#define NUM_MODES 10
+enum DisplayMode { LAMBDAO2, BOOST, RPMMODE, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, IDLECTRL, AFRCMP, ADVANCE, EGO, PORT1, PORT2, PORT3 };
+#define NUM_MODES 15
 DisplayMode currentMode = BOOST;
 
 // Sensor data
 float psi = 0.0, maxPsi = -14.7;
 float baro = 0.0, maps = 0.0, mat = 0.0, clt = 0.0;
 float ethanolContent = 0.0;
+float rpm = 0.0;
 double tps = 0.0;
 float batt = 0.0, ego1 = 0.0, ego2 = 0.0;
+float warmcorr = 0.0;
+float iacStep = 0.0;
+float clIdleTarget = 0.0;
+float ignAdv = 0.0;
+float ignAdvBase = 0.0;
+float ignAdvIdle = 0.0;
+float lambdaValue = 0.0;
+float oxygenPercent = 0.0;
+float aemSystemVolts = 0.0;
+uint16_t aemLambdaRaw = 0;
+int16_t aemOxygenRaw = 0;
+uint8_t aemSystemVoltsRaw = 0;
+uint16_t aemAdc0 = 0;
+uint16_t aemAdc1 = 0;
+uint16_t aemAdc2 = 0;
+uint16_t aemAdc3 = 0;
+bool aemLambdaValid = false;
+bool aemSensorFault = false;
+unsigned long lastAemLogMs = 0;
 
 // Port output states (persisted to flash)
 // USED FOR MAIN FAN TRIGGER
@@ -291,6 +325,60 @@ void drawSensor2(const char* value, const char* unit, const char* label, const c
   display.display();
 }
 
+void drawQuadStat(const char* value1, const char* label1,
+                  const char* value2, const char* label2,
+                  const char* value3, const char* label3,
+                  const char* value4, const char* label4) {
+  display.setFont();
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print(label1);
+  display.print(":");
+  display.print(value1);
+
+  display.setCursor(64, 0);
+  display.print(label2);
+  display.print(":");
+  display.print(value2);
+
+  display.setCursor(0, 16);
+  display.print(label3);
+  display.print(":");
+  display.print(value3);
+
+  display.setCursor(64, 16);
+  display.print(label4);
+  display.print(":");
+  display.print(value4);
+
+  display.display();
+}
+
+void drawTripleStat(const char* value1, const char* label1,
+                    const char* value2, const char* label2,
+                    const char* value3, const char* label3) {
+  display.setFont();
+  display.setTextSize(1);
+
+  display.setCursor(0, 0);
+  display.print(label1);
+  display.print(":");
+  display.print(value1);
+
+  display.setCursor(64, 0);
+  display.print(label2);
+  display.print(":");
+  display.print(value2);
+
+  display.setCursor(0, 16);
+  display.print(label3);
+  display.print(":");
+  display.print(value3);
+
+  display.display();
+}
+
 // --- State Persistence ---
 
 void loadState() {
@@ -375,6 +463,94 @@ void drawPort3() {
   display.display();
 }
 
+uint32_t aemnetMessageId() {
+  return AEMNET_BASE_ID + (uint32_t)(AEMNET_GAUGE_ID - 1);
+}
+
+uint16_t clampTo10Bit(long value) {
+  if (value < 0) return 0;
+  if (value > 1023) return 1023;
+  return (uint16_t)value;
+}
+
+uint16_t voltsToAdc10(float volts) {
+  const float clampedVolts = constrain(volts, 0.0f, 20.0f);
+  const float adc = (clampedVolts / 20.0f) * 1023.0f;
+  return clampTo10Bit((long)(adc + 0.5f));
+}
+
+uint16_t lambdaToAdc10(float lambda) {
+  // Match the gauge's 0.5V-4.5V linear analog output scaling:
+  // 0.58 lambda = 0.5V, 1.23 lambda = 4.5V.
+  // 8.50 stoich = 0.5V, 18.0 lambda = 4.5V.
+  const float clampedLambda = constrain(lambda, 0.58f, 1.23f);
+  const float volts = 0.5f + ((clampedLambda - 0.58f) * (4.0f / 0.65f));
+  return voltsToAdc10(volts);
+}
+
+uint16_t oxygenToAdc10(float oxygen) {
+  // Exhaust oxygen is physically non-negative; clamp to a practical 0-20.9% range
+  // and scale that range across a 0-5V-equivalent 10-bit ADC.
+  const float clampedOxygen = constrain(oxygen, 0.0f, 20.9f);
+  const float volts = (clampedOxygen / 20.9f) * 5.0f;
+  return voltsToAdc10(volts);
+}
+
+uint8_t wordHighByte(uint16_t value) {
+  return (uint8_t)(value >> 8);
+}
+
+uint8_t wordLowByte(uint16_t value) {
+  return (uint8_t)(value & 0xFF);
+}
+
+bool handleAEMnetFrame(const CANMessage &msg) {
+  if (!msg.ext || msg.rtr || msg.len < 8) return false;
+  if (msg.id != aemnetMessageId()) return false;
+
+  aemLambdaRaw = ((uint16_t)msg.data[0] << 8) | msg.data[1];
+  aemOxygenRaw = (int16_t)(((uint16_t)msg.data[2] << 8) | msg.data[3]);
+  aemSystemVoltsRaw = msg.data[4];
+  lambdaValue = aemLambdaRaw * 0.0001f;
+  oxygenPercent = aemOxygenRaw * 0.001f;
+  aemSystemVolts = aemSystemVoltsRaw * 0.1f;
+  aemLambdaValid = (msg.data[6] & 0x80) != 0;
+  aemSensorFault = (msg.data[7] & 0x40) != 0;
+  if (aemLambdaValid && !aemSensorFault) {
+    aemAdc0 = lambdaToAdc10(lambdaValue);
+    aemAdc1 = oxygenToAdc10(oxygenPercent);
+    aemAdc2 = voltsToAdc10(aemSystemVolts);
+  } else {
+    aemAdc0 = 0;
+    aemAdc1 = 0;
+    aemAdc2 = 0;
+  }
+  aemAdc3 = 0;
+
+  const unsigned long now = millis();
+  if (now - lastAemLogMs >= 10) {
+    lastAemLogMs = now;
+    Serial.print("AEM lambda=");
+    Serial.print(lambdaValue, 4);
+    Serial.print(" oxygen=");
+    Serial.print(oxygenPercent, 3);
+    Serial.print("% volts=");
+    Serial.print(aemSystemVolts, 1);
+    Serial.print(" adc0=");
+    Serial.print(aemAdc0);
+    Serial.print(" adc1=");
+    Serial.print(aemAdc1);
+    Serial.print(" adc2=");
+    Serial.print(aemAdc2);
+    Serial.print(" valid=");
+    Serial.print(aemLambdaValid ? "1" : "0");
+    Serial.print(" fault=");
+    Serial.println(aemSensorFault ? "1" : "0");
+  }
+
+  return true;
+}
+
 // Build 29-bit extended CAN ID per MS2/Extra protocol
 uint32_t buildMSCANId(uint16_t var_offset, uint8_t msg_type, uint8_t from_id, uint8_t to_id, uint8_t var_blk) {
   uint32_t id = 0;
@@ -428,11 +604,20 @@ void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8
     uint16_t idx = offset + i;
     uint8_t value = 0x00;
 
-    // Example mapping for your data source
-    if (table == 7) {
-      if (idx == 166) value = port1State ? 1 : 0;
-      else if (idx == 167) value = port2State ? 1 : 0;
-      else if (idx == 168) value = port3State & 0xFF;
+    // Table 7 carries both the ADC block at offsets 104-111 and port states at 166-168.
+    if (table == AEMNET_ADC_TABLE) {
+      if (idx == AEMNET_ADC0_OFFSET) value = wordHighByte(aemAdc0);
+      else if (idx == (AEMNET_ADC0_OFFSET + 1)) value = wordLowByte(aemAdc0);
+      else if (idx == AEMNET_ADC1_OFFSET) value = wordHighByte(aemAdc1);
+      else if (idx == (AEMNET_ADC1_OFFSET + 1)) value = wordLowByte(aemAdc1);
+      else if (idx == AEMNET_ADC2_OFFSET) value = wordHighByte(aemAdc2);
+      else if (idx == (AEMNET_ADC2_OFFSET + 1)) value = wordLowByte(aemAdc2);
+      else if (idx == AEMNET_ADC3_OFFSET) value = wordHighByte(aemAdc3);
+      else if (idx == (AEMNET_ADC3_OFFSET + 1)) value = wordLowByte(aemAdc3);
+
+      else if (idx == PORT_1_OFFSET) value = port1State ? 1 : 0;
+      else if (idx == PORT_2_OFFSET) value = port2State ? 1 : 0;
+      else if (idx == PORT_3_OFFSET) value = port3State & 0xFF;
     }
 
     tx.data[i] = value;
@@ -474,6 +659,10 @@ void updateCAN() {
     }
     Serial.println();
 
+    if (handleAEMnetFrame(rx)) {
+      continue;
+    }
+
     // ------------------------------------------------------------
     // Handle MS2 poll requests (29-bit extended frames)
     // ------------------------------------------------------------
@@ -504,6 +693,14 @@ void updateCAN() {
     // ------------------------------------------------------------
     const uint16_t base = 0x5F0;
 
+    if (rx.id == (base) && rx.len >= 8) {
+      rpm = ((rx.data[6] << 8) | rx.data[7]);
+    }
+
+    if (rx.id == (base + 1) && rx.len >= 8) {
+      ignAdv = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
+    }
+
     if (rx.id == (base + 2) && rx.len >= 8) {
       baro = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
       maps = ((rx.data[2] << 8) | rx.data[3]) / 10.0;
@@ -523,8 +720,25 @@ void updateCAN() {
       ego2 = ((rx.data[6] << 8) | rx.data[7]) / 10.0;
     }
 
+    if (rx.id == (base + 5) && rx.len >= 8) {
+      warmcorr = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+    }
+
+    if (rx.id == (base + 6) && rx.len >= 8) {
+      iacStep = (int16_t)((rx.data[6] << 8) | rx.data[7]);
+    }
+
+    if (rx.id == (base + 28) && rx.len >= 8) {
+      clIdleTarget = (int16_t)((rx.data[0] << 8) | rx.data[1]);
+    }
+
     if (rx.id == (base + 47) && rx.len >= 2) {
       ethanolContent = ((rx.data[0] << 8) | rx.data[1]) / 10.0;
+    }
+
+    if (rx.id == (base + 57) && rx.len >= 8) {
+      ignAdvBase = (int16_t)((rx.data[0] << 8) | rx.data[1]) / 10.0;
+      ignAdvIdle = (int16_t)((rx.data[2] << 8) | rx.data[3]) / 10.0;
     }
   }
 }
@@ -602,6 +816,11 @@ void loop() {
     case BOOST:
       drawBoost2();
       break;
+    case RPMMODE:
+      char rpmBuffer[8];
+      snprintf(rpmBuffer, sizeof(rpmBuffer), "%.0f", rpm);
+      drawSingleStat(rpmBuffer, "", "RPM");
+      break;
     case ETHANOL:
       char ethBuffer[8];
       snprintf(ethBuffer, sizeof(ethBuffer), "E%2.1f", ethanolContent);
@@ -626,7 +845,7 @@ void loop() {
       snprintf(matBuffer, sizeof(matBuffer), "%.1f", mat);
       char cltBuffer[8];
       snprintf(cltBuffer, sizeof(cltBuffer), "%.1f", clt);
-      drawSensor2(matBuffer, " C", "MAT", cltBuffer, " C", "CLT");
+      drawSensor2(matBuffer, " F", "MAT", cltBuffer, " F", "CLT");
       break;
     case BAROMAP:
       char baroBuffer[8];
@@ -635,12 +854,46 @@ void loop() {
       snprintf(mapsBuffer, sizeof(mapsBuffer), "%.1f", maps);
       drawSensor2(baroBuffer, "kpa", "BARO", mapsBuffer, "kpa", "MAP");
       break;
+    case IDLECTRL:
+      char idleAdvBuf[8];
+      snprintf(idleAdvBuf, sizeof(idleAdvBuf), "%.1f", ignAdvIdle);
+      char clIdleBuf[8];
+      snprintf(clIdleBuf, sizeof(clIdleBuf), "%.0f", clIdleTarget);
+      char warmcorrBuf[8];
+      snprintf(warmcorrBuf, sizeof(warmcorrBuf), "%.1f", warmcorr);
+      char iacStepBuf[8];
+      snprintf(iacStepBuf, sizeof(iacStepBuf), "%.0f", iacStep);
+      drawQuadStat(idleAdvBuf, "ICAdv", clIdleBuf, "Trgt", warmcorrBuf, "WUE", iacStepBuf, "IAC");
+      break;
+    case AFRCMP:
+      char aemAfrBuf[8];
+      snprintf(aemAfrBuf, sizeof(aemAfrBuf), "%.1f", lambdaValue * 14.7f);
+      char ego1CompareBuf[8];
+      snprintf(ego1CompareBuf, sizeof(ego1CompareBuf), "%.1f", ego1);
+      drawSensor2(aemAfrBuf, "", "AEMAFR", ego1CompareBuf, "", "EGO1");
+      break;
+    case ADVANCE:
+      char ignAdvBuf[8];
+      snprintf(ignAdvBuf, sizeof(ignAdvBuf), "%.1f", ignAdv);
+      char ignAdvBaseBuf[8];
+      snprintf(ignAdvBaseBuf, sizeof(ignAdvBaseBuf), "%.1f", ignAdvBase);
+      char ignAdvIdleBuf[8];
+      snprintf(ignAdvIdleBuf, sizeof(ignAdvIdleBuf), "%.1f", ignAdvIdle);
+      drawTripleStat(ignAdvBuf, "Adv", ignAdvBaseBuf, "Base", ignAdvIdleBuf, "Idle");
+      break;
     case EGO:
       char ego1Buf[8];
       snprintf(ego1Buf, sizeof(ego1Buf), "%.1f", ego1);
       char ego2Buf[8];
       snprintf(ego2Buf, sizeof(ego2Buf), "%.1f", ego2);
       drawSensor2(ego1Buf, "", "EGO1", ego2Buf, "", "EGO2");
+      break;
+    case LAMBDAO2:
+      char lambdaBuf[8];
+      snprintf(lambdaBuf, sizeof(lambdaBuf), "%.3f", lambdaValue);
+      char oxygenBuf[8];
+      snprintf(oxygenBuf, sizeof(oxygenBuf), "%.2f", oxygenPercent);
+      drawSensor2(lambdaBuf, "", "Lam", oxygenBuf, "%", "O2");
       break;
     case PORT1:
       drawPort1();
