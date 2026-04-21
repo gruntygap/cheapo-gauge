@@ -34,11 +34,11 @@
 // "ID 1" on the gauge corresponds to arbitration ID 0x180, "ID 16" -> 0x18F.
 #define AEMNET_GAUGE_ID 1
 #define AEMNET_BASE_ID 0x180UL
-#define AEMNET_LAMBDA_TABLE 5
-#define AEMNET_ADC0_OFFSET 0
-#define AEMNET_ADC1_OFFSET 2
-#define AEMNET_ADC2_OFFSET 4
-#define AEMNET_ADC3_OFFSET 6
+#define AEMNET_ADC_TABLE PORTS_DATA_TABLE
+#define AEMNET_ADC0_OFFSET 104
+#define AEMNET_ADC1_OFFSET 106
+#define AEMNET_ADC2_OFFSET 108
+#define AEMNET_ADC3_OFFSET 110
 
 // MS2/Extra CAN protocol - 29-bit extended frames
 // ID layout: [var_offset(11)][msg_type(3)][from_id(4)][to_id(4)][var_blk(4)][spare(3)]
@@ -75,9 +75,9 @@ const unsigned long tapThreshold = 200;
 const unsigned long longPressThreshold = 500;
 
 // Modes
-enum DisplayMode { BOOST, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, EGO, PORT1, PORT2, PORT3 };
-#define NUM_MODES 10
-DisplayMode currentMode = BOOST;
+enum DisplayMode { LAMBDAO2, BOOST, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, EGO, PORT1, PORT2, PORT3 };
+#define NUM_MODES 11
+DisplayMode currentMode = LAMBDAO2;
 
 // Sensor data
 float psi = 0.0, maxPsi = -14.7;
@@ -542,8 +542,8 @@ void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8
     uint16_t idx = offset + i;
     uint8_t value = 0x00;
 
-    // Table 5 presents four 16-bit ADC words for Megasquirt CANADC polling.
-    if (table == AEMNET_LAMBDA_TABLE) {
+    // Table 7 carries both the ADC block at offsets 104-111 and port states at 166-168.
+    if (table == AEMNET_ADC_TABLE) {
       if (idx == AEMNET_ADC0_OFFSET) value = wordHighByte(aemAdc0);
       else if (idx == (AEMNET_ADC0_OFFSET + 1)) value = wordLowByte(aemAdc0);
       else if (idx == AEMNET_ADC1_OFFSET) value = wordHighByte(aemAdc1);
@@ -552,8 +552,8 @@ void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8
       else if (idx == (AEMNET_ADC2_OFFSET + 1)) value = wordLowByte(aemAdc2);
       else if (idx == AEMNET_ADC3_OFFSET) value = wordHighByte(aemAdc3);
       else if (idx == (AEMNET_ADC3_OFFSET + 1)) value = wordLowByte(aemAdc3);
-    } else if (table == PORTS_DATA_TABLE) {
-      if (idx == PORT_1_OFFSET) value = port1State ? 1 : 0;
+
+      else if (idx == PORT_1_OFFSET) value = port1State ? 1 : 0;
       else if (idx == PORT_2_OFFSET) value = port2State ? 1 : 0;
       else if (idx == PORT_3_OFFSET) value = port3State & 0xFF;
     }
@@ -726,6 +726,13 @@ void loop() {
   handleButton();
 
   switch (currentMode) {
+    case LAMBDAO2:
+      char lambdaBuf[8];
+      snprintf(lambdaBuf, sizeof(lambdaBuf), "%.3f", lambdaValue);
+      char oxygenBuf[8];
+      snprintf(oxygenBuf, sizeof(oxygenBuf), "%.2f", oxygenPercent);
+      drawSensor2(lambdaBuf, "", "Lam", oxygenBuf, "%", "O2");
+      break;
     case BOOST:
       drawBoost2();
       break;
