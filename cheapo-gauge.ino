@@ -25,6 +25,20 @@
 // CAN Output config - match these to your remote device settings
 #define REMOTE_CAN_ID 2          // This device's CAN ID (set in TunerStudio "Remote CAN ID")
 #define MS2_CAN_ID 0             // Megasquirt's CAN ID (usually 0)
+#define PORTS_DATA_TABLE 7
+#define PORT_1_OFFSET 166
+#define PORT_2_OFFSET 167
+#define PORT_3_OFFSET 168
+
+// AEM X-Series UEGO / AEMnet config
+// "ID 1" on the gauge corresponds to arbitration ID 0x180, "ID 16" -> 0x18F.
+#define AEMNET_GAUGE_ID 1
+#define AEMNET_BASE_ID 0x180UL
+#define AEMNET_LAMBDA_TABLE 5
+#define AEMNET_ADC0_OFFSET 0
+#define AEMNET_ADC1_OFFSET 2
+#define AEMNET_ADC2_OFFSET 4
+#define AEMNET_ADC3_OFFSET 6
 
 // MS2/Extra CAN protocol - 29-bit extended frames
 // ID layout: [var_offset(11)][msg_type(3)][from_id(4)][to_id(4)][var_blk(4)][spare(3)]
@@ -71,6 +85,19 @@ float baro = 0.0, maps = 0.0, mat = 0.0, clt = 0.0;
 float ethanolContent = 0.0;
 double tps = 0.0;
 float batt = 0.0, ego1 = 0.0, ego2 = 0.0;
+float lambdaValue = 0.0;
+float oxygenPercent = 0.0;
+float aemSystemVolts = 0.0;
+uint16_t aemLambdaRaw = 0;
+int16_t aemOxygenRaw = 0;
+uint8_t aemSystemVoltsRaw = 0;
+uint16_t aemAdc0 = 0;
+uint16_t aemAdc1 = 0;
+uint16_t aemAdc2 = 0;
+uint16_t aemAdc3 = 0;
+bool aemLambdaValid = false;
+bool aemSensorFault = false;
+unsigned long lastAemLogMs = 0;
 
 // Port output states (persisted to flash)
 // USED FOR MAIN FAN TRIGGER
@@ -375,6 +402,93 @@ void drawPort3() {
   display.display();
 }
 
+uint32_t aemnetMessageId() {
+  return AEMNET_BASE_ID + (uint32_t)(AEMNET_GAUGE_ID - 1);
+}
+
+uint16_t clampTo10Bit(long value) {
+  if (value < 0) return 0;
+  if (value > 1023) return 1023;
+  return (uint16_t)value;
+}
+
+uint16_t voltsToAdc10(float volts) {
+  const float adc = (volts / 5.0f) * 1023.0f;
+  return clampTo10Bit((long)(adc + 0.5f));
+}
+
+uint16_t lambdaToAdc10(float lambda) {
+  // Match the gauge's 0.5V-4.5V linear analog output scaling:
+  // 0.58 lambda = 0.5V, 1.23 lambda = 4.5V.
+  // 8.50 stoich = 0.5V, 18.0 lambda = 4.5V.
+  const float clampedLambda = constrain(lambda, 0.58f, 1.23f);
+  const float volts = 0.5f + ((clampedLambda - 0.58f) * (4.0f / 0.65f));
+  return voltsToAdc10(volts);
+}
+
+uint16_t oxygenToAdc10(float oxygen) {
+  // Exhaust oxygen is physically non-negative; clamp to a practical 0-20.9% range
+  // and scale that range across a 0-5V-equivalent 10-bit ADC.
+  const float clampedOxygen = constrain(oxygen, 0.0f, 20.9f);
+  const float volts = (clampedOxygen / 20.9f) * 5.0f;
+  return voltsToAdc10(volts);
+}
+
+uint8_t wordHighByte(uint16_t value) {
+  return (uint8_t)(value >> 8);
+}
+
+uint8_t wordLowByte(uint16_t value) {
+  return (uint8_t)(value & 0xFF);
+}
+
+bool handleAEMnetFrame(const CANMessage &msg) {
+  if (!msg.ext || msg.rtr || msg.len < 8) return false;
+  if (msg.id != aemnetMessageId()) return false;
+
+  aemLambdaRaw = ((uint16_t)msg.data[0] << 8) | msg.data[1];
+  aemOxygenRaw = (int16_t)(((uint16_t)msg.data[2] << 8) | msg.data[3]);
+  aemSystemVoltsRaw = msg.data[4];
+  lambdaValue = aemLambdaRaw * 0.0001f;
+  oxygenPercent = aemOxygenRaw * 0.001f;
+  aemSystemVolts = aemSystemVoltsRaw * 0.1f;
+  aemLambdaValid = (msg.data[6] & 0x80) != 0;
+  aemSensorFault = (msg.data[7] & 0x40) != 0;
+  if (aemLambdaValid && !aemSensorFault) {
+    aemAdc0 = lambdaToAdc10(lambdaValue);
+    aemAdc1 = oxygenToAdc10(oxygenPercent);
+    aemAdc2 = voltsToAdc10(aemSystemVolts);
+  } else {
+    aemAdc0 = 0;
+    aemAdc1 = 0;
+    aemAdc2 = 0;
+  }
+  aemAdc3 = 0;
+
+  const unsigned long now = millis();
+  if (now - lastAemLogMs >= 10) {
+    lastAemLogMs = now;
+    Serial.print("AEM lambda=");
+    Serial.print(lambdaValue, 4);
+    Serial.print(" oxygen=");
+    Serial.print(oxygenPercent, 3);
+    Serial.print("% volts=");
+    Serial.print(aemSystemVolts, 1);
+    Serial.print(" adc0=");
+    Serial.print(aemAdc0);
+    Serial.print(" adc1=");
+    Serial.print(aemAdc1);
+    Serial.print(" adc2=");
+    Serial.print(aemAdc2);
+    Serial.print(" valid=");
+    Serial.print(aemLambdaValid ? "1" : "0");
+    Serial.print(" fault=");
+    Serial.println(aemSensorFault ? "1" : "0");
+  }
+
+  return true;
+}
+
 // Build 29-bit extended CAN ID per MS2/Extra protocol
 uint32_t buildMSCANId(uint16_t var_offset, uint8_t msg_type, uint8_t from_id, uint8_t to_id, uint8_t var_blk) {
   uint32_t id = 0;
@@ -428,11 +542,20 @@ void sendPollResponse(uint8_t requesterId, uint8_t table, uint16_t offset, uint8
     uint16_t idx = offset + i;
     uint8_t value = 0x00;
 
-    // Example mapping for your data source
-    if (table == 7) {
-      if (idx == 166) value = port1State ? 1 : 0;
-      else if (idx == 167) value = port2State ? 1 : 0;
-      else if (idx == 168) value = port3State & 0xFF;
+    // Table 5 presents four 16-bit ADC words for Megasquirt CANADC polling.
+    if (table == AEMNET_LAMBDA_TABLE) {
+      if (idx == AEMNET_ADC0_OFFSET) value = wordHighByte(aemAdc0);
+      else if (idx == (AEMNET_ADC0_OFFSET + 1)) value = wordLowByte(aemAdc0);
+      else if (idx == AEMNET_ADC1_OFFSET) value = wordHighByte(aemAdc1);
+      else if (idx == (AEMNET_ADC1_OFFSET + 1)) value = wordLowByte(aemAdc1);
+      else if (idx == AEMNET_ADC2_OFFSET) value = wordHighByte(aemAdc2);
+      else if (idx == (AEMNET_ADC2_OFFSET + 1)) value = wordLowByte(aemAdc2);
+      else if (idx == AEMNET_ADC3_OFFSET) value = wordHighByte(aemAdc3);
+      else if (idx == (AEMNET_ADC3_OFFSET + 1)) value = wordLowByte(aemAdc3);
+    } else if (table == PORTS_DATA_TABLE) {
+      if (idx == PORT_1_OFFSET) value = port1State ? 1 : 0;
+      else if (idx == PORT_2_OFFSET) value = port2State ? 1 : 0;
+      else if (idx == PORT_3_OFFSET) value = port3State & 0xFF;
     }
 
     tx.data[i] = value;
@@ -473,6 +596,10 @@ void updateCAN() {
       Serial.print(rx.data[i], HEX);
     }
     Serial.println();
+
+    if (handleAEMnetFrame(rx)) {
+      continue;
+    }
 
     // ------------------------------------------------------------
     // Handle MS2 poll requests (29-bit extended frames)
