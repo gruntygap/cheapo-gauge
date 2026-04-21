@@ -75,9 +75,9 @@ const unsigned long tapThreshold = 200;
 const unsigned long longPressThreshold = 500;
 
 // Modes
-enum DisplayMode { LAMBDAO2, BOOST, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, EGO, PORT1, PORT2, PORT3 };
-#define NUM_MODES 11
-DisplayMode currentMode = LAMBDAO2;
+enum DisplayMode { LAMBDAO2, BOOST, ETHANOL, VOLTAGE, TPS, MATCLT, BAROMAP, AFRCMP, EGO, PORT1, PORT2, PORT3 };
+#define NUM_MODES 12
+DisplayMode currentMode = BOOST;
 
 // Sensor data
 float psi = 0.0, maxPsi = -14.7;
@@ -413,7 +413,8 @@ uint16_t clampTo10Bit(long value) {
 }
 
 uint16_t voltsToAdc10(float volts) {
-  const float adc = (volts / 5.0f) * 1023.0f;
+  const float clampedVolts = constrain(volts, 0.0f, 20.0f);
+  const float adc = (clampedVolts / 20.0f) * 1023.0f;
   return clampTo10Bit((long)(adc + 0.5f));
 }
 
@@ -726,13 +727,6 @@ void loop() {
   handleButton();
 
   switch (currentMode) {
-    case LAMBDAO2:
-      char lambdaBuf[8];
-      snprintf(lambdaBuf, sizeof(lambdaBuf), "%.3f", lambdaValue);
-      char oxygenBuf[8];
-      snprintf(oxygenBuf, sizeof(oxygenBuf), "%.2f", oxygenPercent);
-      drawSensor2(lambdaBuf, "", "Lam", oxygenBuf, "%", "O2");
-      break;
     case BOOST:
       drawBoost2();
       break;
@@ -769,12 +763,26 @@ void loop() {
       snprintf(mapsBuffer, sizeof(mapsBuffer), "%.1f", maps);
       drawSensor2(baroBuffer, "kpa", "BARO", mapsBuffer, "kpa", "MAP");
       break;
+    case AFRCMP:
+      char aemAfrBuf[8];
+      snprintf(aemAfrBuf, sizeof(aemAfrBuf), "%.1f", lambdaValue * 14.7f);
+      char ego1CompareBuf[8];
+      snprintf(ego1CompareBuf, sizeof(ego1CompareBuf), "%.1f", ego1);
+      drawSensor2(aemAfrBuf, "", "AEMAFR", ego1CompareBuf, "", "EGO1");
+      break;
     case EGO:
       char ego1Buf[8];
       snprintf(ego1Buf, sizeof(ego1Buf), "%.1f", ego1);
       char ego2Buf[8];
       snprintf(ego2Buf, sizeof(ego2Buf), "%.1f", ego2);
       drawSensor2(ego1Buf, "", "EGO1", ego2Buf, "", "EGO2");
+      break;
+    case LAMBDAO2:
+      char lambdaBuf[8];
+      snprintf(lambdaBuf, sizeof(lambdaBuf), "%.3f", lambdaValue);
+      char oxygenBuf[8];
+      snprintf(oxygenBuf, sizeof(oxygenBuf), "%.2f", oxygenPercent);
+      drawSensor2(lambdaBuf, "", "Lam", oxygenBuf, "%", "O2");
       break;
     case PORT1:
       drawPort1();
